@@ -1,0 +1,882 @@
+import {
+  ChatMessage,
+  AttachedFile,
+  UniversalSearchAdminConfig,
+  UniversalSearchCategory,
+  UniversalSearchPayload,
+  UniversalSearchStatsResponse,
+  ApiProviderConfig,
+  ProviderFeatureCapabilities,
+  ProviderApiType,
+  ProviderAuthMethod,
+} from "./types";
+import { generateClientFallbackReply } from "./knowledge";
+import { getFirebaseAuthHeaders } from "./firebase";
+
+export function getBackendBaseUrl(): string {
+  if (typeof window === "undefined") return "";
+
+  // 1. Explicit VITE_BACKEND_URL has the highest priority when configured
+  let envUrl = (import.meta as any).env?.VITE_BACKEND_URL;
+  if (envUrl && typeof envUrl === "string" && envUrl.trim().length > 0) {
+    envUrl = envUrl.trim().replace(/\/+$/, "");
+    if (!envUrl.includes(window.location.hostname)) {
+      return envUrl;
+    }
+  }
+
+  // 2. Same origin works seamlessly for Express dev/Cloud Run AND Netlify Functions (/api/* redirects)
+  return window.location.origin.replace(/\/+$/, "");
+}
+
+export function getBackendWsUrl(): string {
+  const baseUrl = getBackendBaseUrl();
+  if (!baseUrl) return "";
+  if (baseUrl.startsWith("https://")) {
+    return baseUrl.replace(/^https:\/\//, "wss://");
+  }
+  if (baseUrl.startsWith("http://")) {
+    return baseUrl.replace(/^http:\/\//, "ws://");
+  }
+  return baseUrl.replace(/^http/, "ws");
+}
+
+interface SendChatParams {
+  message: string;
+  history?: ChatMessage[];
+  imageBase64?: string;
+  imageMimeType?: string;
+  attachedFile?: AttachedFile;
+  model?: string;
+  uid?: string;
+}
+
+export interface ChatResponse {
+  reply: string;
+  model?: string;
+  providerId?: string;
+  providerName?: string;
+  fallbackUsed?: boolean;
+  fallbackFrom?: string;
+  latencyMs?: number;
+  timestamp?: string;
+  generatedImageUrl?: string;
+  generatedImagePrompt?: string;
+}
+
+export interface PublicAiCapabilities {
+  activeProviderId: string;
+  activeProviderName: string;
+  activeModel: string;
+  supportedFeatures: ProviderFeatureCapabilities;
+  enabledTextProvidersCount: number;
+}
+
+export interface GenerateImageParams {
+  prompt: string;
+  aspectRatio?: '1:1' | '16:9' | '9:16';
+  style?: string;
+  engine?: string;
+  customApiKey?: string;
+}
+
+export interface GenerateImageResponse {
+  success: boolean;
+  imageUrl?: string;
+  directUrl?: string;
+  prompt?: string;
+  refinedPrompt?: string;
+  caption?: string;
+  model?: string;
+  aspectRatio?: string;
+  error?: string;
+  debugInfo?: {
+    userPrompt: string;
+    finalImagePrompt: string;
+    modelUsed: string;
+    apiStatus: string;
+  };
+}
+
+// Bilingual visual phrase replacement map for client-side direct image generation fallback
+const BENGALI_PHRASES_MAP: Array<[RegExp, string]> = [
+  [/মসজিদ|মসজিদের|মসজিদের ছবি/gi, "beautiful majestic mosque with minarets and dome"],
+  [/মন্দির|মন্দিরের/gi, "beautiful traditional temple architecture"],
+  [/বাড়ি|বাড়ি|বাড়ির|বাড়ির ছবি|সুন্দর বাড়ি/gi, "beautiful modern luxury house design"],
+  [/জাহাজ|জাহাজের|জাহাজের ছবি|সমুদ্রের জাহাজ|বড় জাহাজ|বড় জাহাজের/gi, "grand ocean liner passenger ship sailing gracefully on deep blue sea water"],
+  [/লঞ্চ|লঞ্চের|নৌযান/gi, "Bangladeshi passenger river launch ferry boat travelling on wide river"],
+  [/স্টিমার|স্টিমারের/gi, "vintage passenger steamship vessel on river water"],
+  [/বাংলাদেশি নদী|বাংলাদেশের নদী/gi, "Bangladeshi river landscape"],
+  [/পালতোলা নৌকা|পাল তোলা নৌকা|পালতোলা নৌকার/gi, "traditional wooden boat with colorful canvas sail on river water"],
+  [/নৌকা|নৌকার/gi, "traditional wooden country boat on calm water"],
+  [/কাশফুল|কাশ ফুল/gi, "blooming white kash phool reeds along village riverbank"],
+  [/নদীর দৃশ্য/gi, "scenic river landscape view"],
+  [/পাহাড়ি দৃশ্য|পাহাড়ি দৃশ্য/gi, "mountainous landscape scenery"],
+  [/সূর্যাস্তের আলো/gi, "golden sunset light"],
+  [/সূর্যোদয়ের আলো|সূর্যোদয়ের আলো/gi, "morning sunrise light"],
+  [/সবুজ গ্রাম/gi, "lush green rural Bengal village"],
+  [/ধানখেত|ধানক্ষেত/gi, "golden green paddy fields"],
+  [/স্পোর্টস কার/gi, "luxury high-performance sports car"],
+  [/ভবিষ্যতের ঢাকা/gi, "futuristic sci-fi city of Dhaka"],
+  [/বাংলাদেশের মানচিত্র/gi, "topographic physical map of Bangladesh"],
+];
+
+const HUMAN_KEYWORDS = [
+  "মানুষ", "ব্যক্তি", "মেয়ে", "মেয়ে", "ছেলে", "নারী", "পুরুষ", "শিশু", "বাচ্চা",
+  "ডাক্তার", "শিক্ষক", "প্রতিকৃতি", "পোর্ট্রেট",
+  "person", "man", "woman", "girl", "boy", "child", "human", "portrait", "face", "people", "character", "model"
+];
+
+// Bilingual visual translation map for client-side direct image generation fallback (e.g. Netlify)
+const BENGALI_VISUAL_MAP: Record<string, string> = {
+  "বিড়াল": "cute domestic cat",
+  "বেড়াল": "cute domestic cat",
+  "কুকুর": "friendly golden dog",
+  "পাখি": "vibrant colorful bird on a branch",
+  "মাছ": "colorful swimming fish in clear water",
+  "রাজহাঁস": "graceful white swan gliding on peaceful lake",
+  "হাঁস": "swimming duck in village pond",
+  "ময়ূর": "majestic peacock with open iridescent feathers",
+  "ময়ুর": "majestic peacock with open iridescent feathers",
+  "হরিণ": "spotted deer in natural forest",
+  "ঘোড়া": "wild galloping horse in open meadow",
+  "ঘোড়া": "wild galloping horse in open meadow",
+  "হাতি": "noble Asian elephant walking gently in nature",
+  "বাঘ": "royal Bengal tiger in natural jungle habitat",
+  "সিংহ": "magnificent male lion resting with golden mane",
+  "গরু": "gentle cow grazing in green pasture",
+  "নদী": "clear river with gentle ripples",
+  "পাহাড়": "majestic mountain landscape with morning sunlight",
+  "পাহাড়": "majestic mountain landscape with morning sunlight",
+  "ঝর্ণা": "sparkling crystal waterfall cascading over mossy rocks",
+  "সমুদ্র": "ocean waves meeting sandy shoreline",
+  "সৈকত": "peaceful beach with golden sand and waves",
+  "সূর্যোদয়": "golden sunrise over morning horizon with soft mist",
+  "সূর্যোদয়": "golden sunrise over morning horizon with soft mist",
+  "সূর্যাস্ত": "breathtaking sunset sky with golden and red reflections",
+  "গ্রাম": "traditional rural Bengal village with earthen cottages and green fields",
+  "বন": "lush green woodland forest with sunbeams",
+  "জঙ্গল": "dense green jungle with lush foliage",
+  "আকাশ": "clear blue sky with soft white clouds",
+  "মেঘ": "dramatic puffy clouds in the sky",
+  "বৃষ্টি": "rainy day with raindrops and wet pavement reflections",
+  "চাঁদ": "luminous moon in deep clear night sky",
+  "তারা": "starry night sky full of shining stars",
+  "গাছ": "majestic lush green tree",
+  "ধানখেত": "vast golden green paddy fields swaying in breeze",
+  "ধানক্ষেত": "vast golden green paddy fields swaying in breeze",
+  "কাশফুল": "blooming white kash phool reeds along village riverbank",
+  "ফুল": "blooming vibrant flowers with dew drops",
+  "গোলাপ": "fresh red rose with delicate dewdrops on petals",
+  "পদ্ম": "blooming pink lotus flower on water",
+  "শাপলা": "national white water lily floating on serene pond",
+  "বাগান": "peaceful botanical garden with blooming flowers",
+  "মসজিদ": "beautiful majestic mosque with minarets and dome",
+  "মসজিদের": "beautiful majestic mosque with minarets and dome",
+  "মন্দির": "beautiful traditional temple architecture",
+  "বাড়ি": "beautiful modern luxury house design",
+  "বাড়ি": "beautiful modern luxury house design",
+  "ঘর": "cozy beautiful room interior",
+  "মাঝি": "wooden country boat on river",
+  "নৌকা": "traditional wooden country boat on calm water",
+  "পালতোলা": "traditional wooden boat with colorful canvas sail on river",
+  "কৃষক": "green rural agricultural farmland",
+  "মেয়ে": "portrait of a graceful woman with natural lighting",
+  "মেয়ে": "portrait of a graceful woman with natural lighting",
+  "নারী": "portrait of an elegant woman in traditional attire",
+  "ছেলে": "portrait of a young man with natural soft lighting",
+  "শিশু": "happy joyful cute child smiling outdoors",
+  "ডাক্তার": "caring professional doctor in modern clinic",
+  "শিক্ষক": "dedicated teacher in classroom",
+  "বৃদ্ধ": "wise elderly person with kind smile",
+  "জাহাজ": "grand ocean liner passenger ship sailing gracefully on blue sea water",
+  "জাহাজের": "grand ocean liner passenger ship sailing gracefully on blue sea water",
+  "লঞ্চ": "Bangladeshi passenger river launch ferry boat travelling on wide river",
+  "স্টিমার": "vintage passenger steamship vessel on river water",
+  "গাড়ি": "sleek modern car on road",
+  "কার": "sleek modern car on road",
+  "স্পোর্টস কার": "luxury high-performance sports car",
+  "মোটরসাইকেল": "stylish modern motorcycle on scenic highway",
+  "ট্রেন": "passenger train travelling through scenic countryside",
+  "উড়োজাহাজ": "modern commercial airplane flying above white clouds",
+  "প্লেন": "airplane in sky",
+  "রোবট": "futuristic sleek humanoid robot with illuminated details",
+  "শহর": "modern city street with architecture and traffic",
+  "ঢাকা": "vibrant city scene of Dhaka with landmarks and urban life",
+  "লাল": "red",
+  "নীল": "blue",
+  "সবুজ": "green",
+  "কালো": "black",
+  "সাদা": "white",
+  "হলুদ": "yellow",
+  "সোনালী": "golden",
+  "রুপালী": "silver",
+  "সুন্দর": "beautiful",
+  "আসল": "authentic realistic photograph",
+  "বাস্তব": "realistic authentic photo",
+};
+
+export function clientTranslateImagePrompt(prompt: string): string {
+  let clean = prompt.trim();
+  clean = clean.replace(/^(draw:|image:|ছবি:|ছবি আঁকো:|ছবি তৈরি করো:|\/image|\/draw)\s*/i, "");
+  clean = clean.replace(/^(আমাকে|একটি|একটা|দয়া করে|প্লিজ)\s+/i, "");
+  clean = clean.replace(/(ছবি আঁকো|ছবি বানাও|ছবি তৈরি করো|ছবি বানিয়ে দাও|ছবি এঁকে দাও|এর ছবি দাও|এর ছবি চাই|ছবি চাই|ছবি তৈরি করে দেন|ছবি বানিয়ে দেন|ছবি তৈরি করে দাও|draw an image of|generate an image of|create a picture of|draw a|paint a)/gi, "");
+  clean = clean.trim();
+
+  const requestsHuman = HUMAN_KEYWORDS.some(kw => prompt.toLowerCase().includes(kw));
+
+  let textToTranslate = clean;
+  // First, replace known multi-word phrases
+  for (const [regex, replacement] of BENGALI_PHRASES_MAP) {
+    textToTranslate = textToTranslate.replace(regex, replacement);
+  }
+
+  // Tokenize & map remaining words
+  const words = textToTranslate.split(/\s+/);
+  const translatedParts: string[] = [];
+
+  for (const rawWord of words) {
+    // Strip trailing punctuation
+    const wordClean = rawWord.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()|"'।]/g, "").trim();
+    if (!wordClean) continue;
+
+    if (BENGALI_VISUAL_MAP[wordClean]) {
+      translatedParts.push(BENGALI_VISUAL_MAP[wordClean]);
+      continue;
+    }
+
+    const stemmed = wordClean.replace(/(ের|এর|টি|টা|গুলো|গুলোর|কে|তে)$/, "");
+    if (BENGALI_VISUAL_MAP[stemmed]) {
+      translatedParts.push(BENGALI_VISUAL_MAP[stemmed]);
+      continue;
+    }
+
+    translatedParts.push(wordClean);
+  }
+
+  let translated = translatedParts.join(" ");
+
+  // Strip any remaining raw Bengali script to ensure clean English prompt for text-to-image models
+  translated = translated.replace(/[\u0980-\u09FF]+/g, "").replace(/\s+/g, " ").trim();
+
+  if (!translated || translated.length < 3) {
+    translated = "grand ocean liner passenger ship sailing on water";
+  }
+
+  // Strictly exclude humans if user did not request a person/portrait
+  if (!requestsHuman) {
+    return `${translated}, high quality, beautiful lighting, clear focus, no humans, no people, no portraits`;
+  }
+
+  return `${translated}, ultra realistic, 4k resolution, high detail, photorealistic photography`;
+}
+
+export function isImageGenerationIntent(text: string): boolean {
+  if (!text || typeof text !== "string") return false;
+  const t = text.trim();
+  const lower = t.toLowerCase();
+
+  if (
+    lower.startsWith("draw:") ||
+    lower.startsWith("image:") ||
+    lower.startsWith("ছবি:") ||
+    lower.startsWith("ছবি আঁকো:") ||
+    lower.startsWith("ছবি তৈরি করো:") ||
+    lower.startsWith("/image") ||
+    lower.startsWith("/draw")
+  ) {
+    return true;
+  }
+
+  const banglaPatterns = [
+    /(ছবি|চিত্র|পিকচার|ড্রয়িং|ওয়ালপেপার).*(আঁকো|আঁকা|বানাও|তৈরি|দেখা|করো|দিন|চাই|বানিয়ে দাও|বানিয়ে দিন|দাও)/i,
+    /(আঁকো|বানাও|তৈরি করো|আঁক|জেনারেট করো|বানিয়ে দাও|এঁকে দাও).*(ছবি|চিত্র|পিকচার|ওয়ালপেপার)/i,
+    /(একটি|একটা|সুন্দর|কিছু).*(ছবি|চিত্র|পিকচার).*(আঁকো|বানাও|তৈরি|চাই|দাও)/i,
+    /(আমাকে|আমাদের).*(ছবি|চিত্র).*(দাও|বানিয়ে দাও|এঁকে দাও)/i,
+    /ছবি\s+বানাও/i,
+    /ছবি\s+আঁকো/i,
+    /ছবি\s+তৈরি\s+করো/i,
+  ];
+
+  if (banglaPatterns.some((p) => p.test(t))) return true;
+
+  const englishPatterns = [
+    /(generate|create|draw|paint|make|produce)\s+(an?\s+)?(image|picture|photo|wallpaper|illustration|art|painting|drawing)/i,
+    /(draw|paint|illustrate)\s+(me\s+)?(an?\s+)?/i,
+    /^picture\s+of\s+/i,
+    /^image\s+of\s+/i,
+  ];
+
+  return englishPatterns.some((p) => p.test(lower));
+}
+
+async function translatePromptDynamicallyOnClient(userPrompt: string): Promise<string> {
+  let clean = userPrompt.trim();
+  clean = clean.replace(/^(draw:|image:|ছবি:|ছবি আঁকো:|ছবি তৈরি করো:|\/image|\/draw)\s*/i, "");
+  clean = clean.replace(/^(আমাকে|একটি|একটা|দয়া করে|প্লিজ)\s+/i, "");
+  clean = clean.replace(/(ছবি আঁকো|ছবি বানাও|ছবি তৈরি করো|ছবি বানিয়ে দাও|ছবি এঁকে দাও|এর ছবি দাও|এর ছবি চাই|ছবি চাই|ছবি তৈরি করে দেন|ছবি বানিয়ে দেন|ছবি তৈরি করে দাও|draw an image of|generate an image of|create a picture of|draw a|paint a)/gi, "");
+  clean = clean.trim();
+
+  const requestsHuman = HUMAN_KEYWORDS.some(kw => userPrompt.toLowerCase().includes(kw));
+
+  // Try MyMemory Dynamic Translation first!
+  try {
+    const myMemoryUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(clean)}&langpair=bn|en`;
+    const response = await fetch(myMemoryUrl);
+    if (response.ok) {
+      const data = await response.json() as any;
+      const apiTranslated = data.responseData?.translatedText;
+      if (apiTranslated && apiTranslated.trim().length > 1 && !/[\u0980-\u09FF]/.test(apiTranslated)) {
+        let result = apiTranslated.trim().replace(/^["']|["']$/g, "");
+        if (!requestsHuman) {
+          return `${result}, high quality, beautiful lighting, clear focus, no humans, no people, no portraits`;
+        }
+        return `${result}, ultra realistic, 4k resolution, high detail, photorealistic photography`;
+      }
+    }
+  } catch (err) {
+    console.warn("MyMemory client translation failed, using fallback mapper", err);
+  }
+
+  // Fallback to local synchronous mapper
+  let textToTranslate = clean;
+  for (const [regex, replacement] of BENGALI_PHRASES_MAP) {
+    textToTranslate = textToTranslate.replace(regex, replacement);
+  }
+
+  const words = textToTranslate.split(/\s+/);
+  const translatedParts: string[] = [];
+
+  for (const rawWord of words) {
+    const wordClean = rawWord.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()|"'।]/g, "").trim();
+    if (!wordClean) continue;
+
+    if (BENGALI_VISUAL_MAP[wordClean]) {
+      translatedParts.push(BENGALI_VISUAL_MAP[wordClean]);
+      continue;
+    }
+
+    const stemmed = wordClean.replace(/(ের|এর|টি|টা|গুলো|গুলোর|কে|তে)$/, "");
+    if (BENGALI_VISUAL_MAP[stemmed]) {
+      translatedParts.push(BENGALI_VISUAL_MAP[stemmed]);
+      continue;
+    }
+
+    translatedParts.push(wordClean);
+  }
+
+  let translated = translatedParts.join(" ");
+  translated = translated.replace(/[\u0980-\u09FF]+/g, "").replace(/\s+/g, " ").trim();
+
+  if (!translated || translated.length < 3) {
+    translated = "beautiful majestic scenery";
+  }
+
+  if (!requestsHuman) {
+    return `${translated}, high quality, beautiful lighting, clear focus, no humans, no people, no portraits`;
+  }
+
+  return `${translated}, ultra realistic, 4k resolution, high detail, photorealistic photography`;
+}
+
+async function clientDirectImageGeneration(params: GenerateImageParams): Promise<GenerateImageResponse> {
+  const { prompt, aspectRatio = "1:1", style } = params;
+  const translatedPrompt = await translatePromptDynamicallyOnClient(prompt);
+  let finalPrompt = translatedPrompt;
+  if (style && style !== "default" && style !== "photorealistic" && style !== "portrait") {
+    finalPrompt += `, in ${style} style`;
+  }
+
+  let width = 1024;
+  let height = 1024;
+  if (aspectRatio === "16:9") {
+    width = 1024;
+    height = 576;
+  } else if (aspectRatio === "9:16") {
+    width = 576;
+    height = 1024;
+  }
+
+  const seed = Math.floor(Math.random() * 1000000);
+  // Disabled enhance=true to prevent Pollinations' prompt hallucination of unwanted human portraits
+  const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(finalPrompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true&enhance=false&model=flux`;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+    const response = await fetch(pollinationsUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const blob = await response.blob();
+      if (blob.size > 500) {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+
+        return {
+          success: true,
+          imageUrl: dataUrl,
+          directUrl: dataUrl,
+          prompt: prompt,
+          refinedPrompt: finalPrompt,
+          caption: `আমি আপনার অনুরোধ অনুযায়ী "${prompt}"-এর চমৎকার ছবি তৈরি করেছি!`,
+          model: "Flux / Sajjat AI Neural Engine",
+          aspectRatio: aspectRatio,
+          debugInfo: {
+            userPrompt: prompt,
+            finalImagePrompt: finalPrompt,
+            modelUsed: "Flux / Pollinations Channel",
+            apiStatus: "Success"
+          }
+        };
+      }
+    }
+  } catch (err: any) {
+    console.error("Direct image generation error:", err);
+  }
+
+  return {
+    success: false,
+    error: "ছবি তৈরি করতে সমস্যা হয়েছে। দয়া করে আপনার প্রম্পট পরিবর্তন বা আবার চেষ্টা করুন।",
+    debugInfo: {
+      userPrompt: prompt,
+      finalImagePrompt: finalPrompt,
+      modelUsed: "Flux / Pollinations Channel",
+      apiStatus: "Error"
+    }
+  };
+}
+
+export async function generateAiImageApi(params: GenerateImageParams): Promise<GenerateImageResponse> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
+
+  try {
+    const res = await fetch(`${getBackendBaseUrl()}/api/generate-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const data = await res.json();
+      if (!data.success && data.error) {
+        return {
+          success: false,
+          error: data.error,
+          debugInfo: data.debugInfo || {
+            userPrompt: params.prompt,
+            finalImagePrompt: params.prompt,
+            modelUsed: params.engine || "Sajjat Ai Image Engine",
+            apiStatus: "Error"
+          }
+        };
+      }
+      if (data.success && (data.imageUrl || data.directUrl)) {
+        return data;
+      }
+    }
+  } catch {
+    clearTimeout(timeoutId);
+  }
+
+  // Seamless open render fallback when backend endpoint is unavailable
+  return clientDirectImageGeneration(params);
+}
+
+export async function fetchPublicAiCapabilities(): Promise<PublicAiCapabilities> {
+  const defaultCaps: PublicAiCapabilities = {
+    activeProviderId: "gemini",
+    activeProviderName: "Sajjat Ai Engine",
+    activeModel: "gemini-4-hydrogen",
+    supportedFeatures: {
+      textChat: true,
+      imageVision: true,
+      fileUpload: true,
+      voice: true,
+      imageGen: true,
+    },
+    enabledTextProvidersCount: 1,
+  };
+  try {
+    const res = await fetch(`${getBackendBaseUrl()}/api/ai-capabilities`, {
+      method: "GET",
+      cache: "no-store",
+    });
+    if (!res.ok) return defaultCaps;
+    const data = await res.json();
+    if (data && data.supportedFeatures) {
+      return data as PublicAiCapabilities;
+    }
+  } catch {
+    // ignore network failure
+  }
+  return defaultCaps;
+}
+
+export async function fetchAdminProvidersApi(): Promise<{
+  success: boolean;
+  activeProviderId: string;
+  providers: ApiProviderConfig[];
+  error?: string;
+}> {
+  const authHeaders = await getFirebaseAuthHeaders();
+  const res = await fetch(`${getBackendBaseUrl()}/api/admin/providers`, {
+    method: "GET",
+    headers: authHeaders,
+    cache: "no-store",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return {
+      success: false,
+      activeProviderId: "gemini",
+      providers: [],
+      error: data?.error || `HTTP ${res.status}`,
+    };
+  }
+  return {
+    success: true,
+    activeProviderId: data.activeProviderId || "gemini",
+    providers: Array.isArray(data.providers) ? data.providers : [],
+  };
+}
+
+export async function saveAdminProviderApi(payload: {
+  id?: string;
+  name?: string;
+  apiKey?: string;
+  baseUrl?: string;
+  modelId?: string;
+  apiType?: ProviderApiType;
+  authMethod?: ProviderAuthMethod;
+  customAuthHeaderName?: string;
+  priority?: number;
+  enabled?: boolean;
+  active?: boolean;
+  isCustom?: boolean;
+  supportedFeatures?: Partial<ProviderFeatureCapabilities>;
+  description?: string;
+}): Promise<{
+  success: boolean;
+  provider?: ApiProviderConfig;
+  providers?: ApiProviderConfig[];
+  activeProviderId?: string;
+  error?: string;
+}> {
+  const authHeaders = await getFirebaseAuthHeaders();
+  const res = await fetch(`${getBackendBaseUrl()}/api/admin/providers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return { success: false, error: data?.error || `HTTP ${res.status}` };
+  }
+  return data;
+}
+
+export async function deleteAdminProviderApi(id: string): Promise<{
+  success: boolean;
+  providers?: ApiProviderConfig[];
+  activeProviderId?: string;
+  error?: string;
+}> {
+  const authHeaders = await getFirebaseAuthHeaders();
+  const res = await fetch(`${getBackendBaseUrl()}/api/admin/providers/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    return { success: false, error: data?.error || `HTTP ${res.status}` };
+  }
+  return data;
+}
+
+export async function testAdminProviderApi(payload: {
+  providerId?: string;
+  apiKey?: string;
+  baseUrl?: string;
+  modelId?: string;
+  apiType?: ProviderApiType;
+  authMethod?: ProviderAuthMethod;
+  customAuthHeaderName?: string;
+}): Promise<{
+  success: boolean;
+  latencyMs?: number;
+  reply?: string;
+  error?: string;
+  rateLimitHeaders?: Record<string, string> | null;
+}> {
+  const authHeaders = await getFirebaseAuthHeaders();
+  const res = await fetch(`${getBackendBaseUrl()}/api/admin/test-provider`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders },
+    body: JSON.stringify(payload),
+  });
+  return await res.json().catch(() => ({ success: false, error: `HTTP ${res.status}` }));
+}
+
+export async function sendChatMessage(params: SendChatParams): Promise<ChatResponse> {
+  const {
+    message,
+    history = [],
+    imageBase64,
+    imageMimeType,
+    attachedFile,
+    model,
+    uid,
+  } = params;
+
+  // Check if message is requesting image generation
+  if (!imageBase64 && !attachedFile && isImageGenerationIntent(message)) {
+    try {
+      const imgRes = await generateAiImageApi({ prompt: message });
+      if (imgRes.success && (imgRes.imageUrl || imgRes.directUrl)) {
+        return {
+          reply: imgRes.caption || "আমি আপনার অনুরোধ অনুযায়ী ছবিটি তৈরি করেছি! নিচে ছবিটি দেখুন।",
+          generatedImageUrl: imgRes.imageUrl || imgRes.directUrl,
+          generatedImagePrompt: imgRes.refinedPrompt || message,
+          model: "Sajjat Ai Studio",
+          timestamp: new Date().toISOString(),
+        };
+      }
+    } catch (e) {
+      console.warn("Direct image intent generation error:", e);
+    }
+  }
+
+  // Always call server-side /api/chat (express backend or Netlify ai-gateway function) — NEVER expose keys in browser
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (attempt > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 450));
+      }
+
+      const res = await fetch(`${getBackendBaseUrl()}/api/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          message,
+          history,
+          model,
+          imageBase64: imageBase64 || attachedFile?.base64,
+          imageMimeType: imageMimeType || (attachedFile?.isImage ? attachedFile.type : undefined),
+          fileContent: attachedFile && !attachedFile.isImage ? attachedFile.content : undefined,
+          fileName: attachedFile?.name,
+          uid,
+        }),
+      });
+
+      const contentType = res.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = await res.json();
+        if (res.ok && data?.reply) {
+          return data as ChatResponse;
+        }
+        if (attempt === 1) {
+          throw new Error(data?.error || `সার্ভার ত্রুটি (${res.status})`);
+        }
+      } else if (attempt === 1) {
+        throw new Error(`সার্ভার ত্রুটি (${res.status})`);
+      }
+    } catch (networkError: any) {
+      if (attempt === 1) {
+        console.warn("Server /api/chat error:", networkError?.message);
+        if (networkError?.message && !networkError.message.includes("Failed to fetch")) {
+          throw networkError;
+        }
+        return {
+          reply: generateClientFallbackReply(message, attachedFile?.name),
+          model: "Sajjat Ai Offline Core",
+          timestamp: new Date().toISOString(),
+        };
+      }
+    }
+  }
+
+  return {
+    reply: generateClientFallbackReply(message, attachedFile?.name),
+    model: "Sajjat Ai Offline Core",
+    timestamp: new Date().toISOString(),
+  };
+}
+
+export interface EditImageParams {
+  image: string;
+  instruction: string;
+  customApiKey?: string;
+}
+
+export interface EditImageResponse {
+  success: boolean;
+  imageUrl?: string;
+  method?: string;
+  error?: string;
+}
+
+export async function editAiImageApi(params: EditImageParams): Promise<EditImageResponse> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const res = await fetch(`${getBackendBaseUrl()}/api/edit-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const contentType = res.headers.get("content-type") || "";
+    if (res.ok && contentType.includes("application/json")) {
+      const data = await res.json();
+      if (data.success && data.imageUrl) {
+        return data;
+      }
+    }
+  } catch {
+    clearTimeout(timeoutId);
+  }
+
+  // Fallback for Netlify / Static hosting
+  try {
+    const imgRes = await clientDirectImageGeneration({ prompt: params.instruction });
+    return {
+      success: true,
+      imageUrl: imgRes.imageUrl,
+      method: "Sajjat AI Direct Neural Edit",
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || "ছবি এডিট করতে সমস্যা হয়েছে।",
+    };
+  }
+}
+
+export interface RunUniversalSearchParams {
+  query: string;
+  forcedCategory?: UniversalSearchCategory;
+  uid?: string;
+  userName?: string;
+}
+
+export interface RunUniversalSearchResponse extends UniversalSearchPayload {
+  success: boolean;
+  timestamp?: string;
+  error?: string;
+}
+
+export async function runUniversalSearchApi(
+  params: RunUniversalSearchParams
+): Promise<RunUniversalSearchResponse> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 22000);
+
+  try {
+    const res = await fetch(`${getBackendBaseUrl()}/api/universal-search/query`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const data = await res.json();
+      if (!res.ok) {
+        return {
+          success: false,
+          intent: "chat",
+          refinedQuery: params.query,
+          summaryMarkdown: "",
+          results: [],
+          sourcesUsed: [],
+          error: data?.error || `সার্ভার ত্রুটি (${res.status})`,
+        };
+      }
+      return data as RunUniversalSearchResponse;
+    }
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    console.warn("Universal search API unavailable, falling back to regular chat:", err?.message);
+  }
+
+  return {
+    success: false,
+    intent: "chat",
+    refinedQuery: params.query,
+    summaryMarkdown: "",
+    results: [],
+    sourcesUsed: [],
+  };
+}
+
+export async function fetchUniversalSearchStatsApi(): Promise<
+  (UniversalSearchStatsResponse & { success: boolean }) | null
+> {
+  try {
+    const authHeaders = await getFirebaseAuthHeaders();
+    const res = await fetch(`${getBackendBaseUrl()}/api/universal-search/admin/stats`, {
+      headers: authHeaders,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateUniversalSearchConfigApi(
+  config: Partial<UniversalSearchAdminConfig>
+): Promise<{ success: boolean; config?: UniversalSearchAdminConfig }> {
+  try {
+    const authHeaders = await getFirebaseAuthHeaders();
+    const res = await fetch(`${getBackendBaseUrl()}/api/universal-search/admin/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders },
+      body: JSON.stringify(config),
+    });
+    if (!res.ok) return { success: false };
+    return await res.json();
+  } catch {
+    return { success: false };
+  }
+}
+
+export async function clearUniversalSearchLogsApi(): Promise<boolean> {
+  try {
+    const authHeaders = await getFirebaseAuthHeaders();
+    const res = await fetch(`${getBackendBaseUrl()}/api/universal-search/admin/clear-logs`, {
+      method: "POST",
+      headers: authHeaders,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export function getUniversalSearchDownloadUrl(rawUrl: string, fileName?: string): string {
+  const safeName = (fileName || "sajjat-ai-media").replace(/[^a-zA-Z0-9._-]/g, "_");
+  return `${getBackendBaseUrl()}/api/universal-search/download?url=${encodeURIComponent(
+    rawUrl
+  )}&name=${encodeURIComponent(safeName)}`;
+}
+
+
+
